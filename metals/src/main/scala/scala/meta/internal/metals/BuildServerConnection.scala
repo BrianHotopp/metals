@@ -646,6 +646,18 @@ object BuildServerConnection {
               .wrapMessages(wrapper(_))
               .create()
           val listening = launcher.startListening()
+          // Complete the finished promise when the JSONRPC listener ends
+          // (socket EOF/error). For process-spawned servers this is redundant
+          // (they complete via proc.complete), but for direct socket connections
+          // to a shared sbt server this is the only detection mechanism.
+          val listeningMonitor = new Thread(() => {
+            try listening.get()
+            catch { case _: Exception => () }
+            conn.finishedPromise.trySuccess(())
+          })
+          listeningMonitor.setDaemon(true)
+          listeningMonitor.setName(s"$serverName-bsp-listener-monitor")
+          listeningMonitor.start()
           val server = launcher.getRemoteProxy
           val stopListening =
             Cancelable(() => listening.cancel(false))

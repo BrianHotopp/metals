@@ -273,9 +273,9 @@ final class BspServers(
         "sbt direct socket input",
       )
 
-      // The finished promise is completed via JSONRPC error handling when the
-      // socket disconnects; the launcher's listener thread detects the broken
-      // connection and triggers reconnection through the register() error path.
+      // The finished promise is completed by the listener monitor thread in
+      // BuildServerConnection.setupServer() when the JSONRPC stream ends
+      // (socket EOF/error), which triggers automatic reconnection.
       val finished = Promise[Unit]()
 
       Some(
