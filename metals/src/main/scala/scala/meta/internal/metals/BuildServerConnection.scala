@@ -628,73 +628,74 @@ object BuildServerConnection {
   ): Future[BuildServerConnection] = {
 
     def setupServer(): Future[LauncherConnection] = {
-      connect().map { case conn @ SocketConnection(_, output, input, _, _, optToken) =>
-        val tracePrinter = Trace.setupTracePrinter("BSP", bspTraceRoot)
-        val requestMonitorOpt =
-          bspStatusOpt.map(new RequestMonitorImpl(_, serverName))
-        val wrapper: MessageConsumer => MessageConsumer =
-          requestMonitorOpt.map(_.wrapper).getOrElse(identity)
-        val launcher =
-          new Launcher.Builder[MetalsBuildServer]()
-            .traceMessages(tracePrinter.orNull)
-            .setOutput(output)
-            .setInput(input)
-            .setLocalService(localClient)
-            .setRemoteInterface(classOf[MetalsBuildServer])
-            .setExecutorService(ec)
-            .wrapMessages(wrapper(_))
-            .create()
-        val listening = launcher.startListening()
-        val server = launcher.getRemoteProxy
-        val stopListening =
-          Cancelable(() => listening.cancel(false))
-        val result =
-          try {
-            BuildServerConnection.initialize(
-              projectRoot,
-              server,
-              serverName,
-              config,
-              userConfiguration,
-              optToken,
+      connect().map {
+        case conn @ SocketConnection(_, output, input, _, _, optToken) =>
+          val tracePrinter = Trace.setupTracePrinter("BSP", bspTraceRoot)
+          val requestMonitorOpt =
+            bspStatusOpt.map(new RequestMonitorImpl(_, serverName))
+          val wrapper: MessageConsumer => MessageConsumer =
+            requestMonitorOpt.map(_.wrapper).getOrElse(identity)
+          val launcher =
+            new Launcher.Builder[MetalsBuildServer]()
+              .traceMessages(tracePrinter.orNull)
+              .setOutput(output)
+              .setInput(input)
+              .setLocalService(localClient)
+              .setRemoteInterface(classOf[MetalsBuildServer])
+              .setExecutorService(ec)
+              .wrapMessages(wrapper(_))
+              .create()
+          val listening = launcher.startListening()
+          val server = launcher.getRemoteProxy
+          val stopListening =
+            Cancelable(() => listening.cancel(false))
+          val result =
+            try {
+              BuildServerConnection.initialize(
+                projectRoot,
+                server,
+                serverName,
+                config,
+                userConfiguration,
+                optToken,
+              )
+            } catch {
+              case e: TimeoutException =>
+                conn.cancelables.foreach(_.cancel())
+                stopListening.cancel()
+                scribe.error("Timeout waiting for 'build/initialize' response")
+                throw e
+            }
+
+          // For Bloop we use the `workspace/buildTargets`,
+          // since the `buildTarget/compile` request with empty targets results in an error
+          val ping: () => Unit =
+            if (serverName == BloopServers.name || ScalaCli.names(serverName))
+              () => server.workspaceBuildTargets()
+            else
+              () => server.buildTargetCompile(new CompileParams(Nil.asJava))
+
+          val optServerLivenessMonitor =
+            for {
+              bspStatus <- bspStatusOpt
+              requestMonitor <- requestMonitorOpt
+            } yield new ServerLivenessMonitor(
+              requestMonitor,
+              ping,
+              config.metalsToIdleTime,
+              config.pingInterval,
+              bspStatus,
             )
-          } catch {
-            case e: TimeoutException =>
-              conn.cancelables.foreach(_.cancel())
-              stopListening.cancel()
-              scribe.error("Timeout waiting for 'build/initialize' response")
-              throw e
-          }
 
-        // For Bloop we use the `workspace/buildTargets`,
-        // since the `buildTarget/compile` request with empty targets results in an error
-        val ping: () => Unit =
-          if (serverName == BloopServers.name || ScalaCli.names(serverName))
-            () => server.workspaceBuildTargets()
-          else
-            () => server.buildTargetCompile(new CompileParams(Nil.asJava))
-
-        val optServerLivenessMonitor =
-          for {
-            bspStatus <- bspStatusOpt
-            requestMonitor <- requestMonitorOpt
-          } yield new ServerLivenessMonitor(
-            requestMonitor,
-            ping,
-            config.metalsToIdleTime,
-            config.pingInterval,
-            bspStatus,
+          LauncherConnection(
+            conn,
+            server,
+            result.getDisplayName(),
+            stopListening,
+            result.getVersion(),
+            result.getCapabilities(),
+            optServerLivenessMonitor,
           )
-
-        LauncherConnection(
-          conn,
-          server,
-          result.getDisplayName(),
-          stopListening,
-          result.getVersion(),
-          result.getCapabilities(),
-          optServerLivenessMonitor,
-        )
       }
     }
 
