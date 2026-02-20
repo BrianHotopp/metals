@@ -628,7 +628,7 @@ object BuildServerConnection {
   ): Future[BuildServerConnection] = {
 
     def setupServer(): Future[LauncherConnection] = {
-      connect().map { case conn @ SocketConnection(_, output, input, _, _) =>
+      connect().map { case conn @ SocketConnection(_, output, input, _, _, optToken) =>
         val tracePrinter = Trace.setupTracePrinter("BSP", bspTraceRoot)
         val requestMonitorOpt =
           bspStatusOpt.map(new RequestMonitorImpl(_, serverName))
@@ -656,6 +656,7 @@ object BuildServerConnection {
               serverName,
               config,
               userConfiguration,
+              optToken,
             )
           } catch {
             case e: TimeoutException =>
@@ -756,6 +757,7 @@ object BuildServerConnection {
       serverName: String,
       config: MetalsServerConfig,
       userConfiguration: UserConfiguration,
+      optToken: Option[String] = None,
   ): InitializeBuildResult = {
     val isBazel = serverName == BazelBuildTool.bspName
     val gson = new Gson
@@ -779,6 +781,11 @@ object BuildServerConnection {
           ),
           "bloop-data-kind",
         )
+
+    // Include authentication token for direct socket connections to sbt server
+    optToken.foreach { token =>
+      data.getAsJsonObject.addProperty("token", token)
+    }
 
     val capabilities = new BuildClientCapabilities(
       List("scala", "java").asJava
@@ -854,4 +861,5 @@ case class SocketConnection(
     input: InputStream,
     cancelables: List[Cancelable],
     finishedPromise: Promise[Unit],
+    optToken: Option[String] = None,
 )

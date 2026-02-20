@@ -1,7 +1,12 @@
 package scala.meta.internal.bsp
 
+import java.io.File
+import java.net.InetAddress
+import java.net.Socket
+import java.net.URI
 import java.nio.charset.Charset
 import java.nio.charset.StandardCharsets
+import java.nio.file.Files
 import java.security.MessageDigest
 
 import scala.concurrent.ExecutionContext
@@ -10,6 +15,7 @@ import scala.concurrent.Future
 import scala.concurrent.Promise
 import scala.util.Properties
 import scala.util.Try
+import scala.util.control.NonFatal
 
 import scala.meta.internal.bsp.BspServers.readInBspConfig
 import scala.meta.internal.io.FileIO
@@ -35,6 +41,8 @@ import scala.meta.io.AbsolutePath
 
 import ch.epfl.scala.bsp4j.BspConnectionDetails
 import com.google.gson.Gson
+import org.scalasbt.ipcsocket.UnixDomainSocket
+import org.scalasbt.ipcsocket.Win32NamedPipeSocket
 
 /**
  * Implements BSP server discovery, named "BSP Connection Protocol" in the spec.
@@ -80,6 +88,18 @@ final class BspServers(
   ): Future[BuildServerConnection] = {
 
     def newConnection(): Future[SocketConnection] = {
+      // For sbt, try direct socket connection to an already-running server first
+      if (details.getName() == "sbt") {
+        tryDirectSbtConnection(projectDirectory) match {
+          case Some(conn) =>
+            scribe.info("Connected to sbt server via direct socket connection")
+            return Future.successful(conn)
+          case None =>
+            scribe.info(
+              "No running sbt server found, falling back to spawning process"
+            )
+        }
+      }
 
       val args = details.getArgv.asScala.toList
         /* When running on Windows, the sbt script is passed as an argument to the
@@ -178,6 +198,101 @@ final class BspServers(
       bspStatusOpt,
       workDoneProgress = workDoneProgress,
     )
+  }
+
+  /**
+   * Try to connect directly to an already-running sbt server by reading the
+   * portfile and connecting to its socket. This avoids spawning a new JVM
+   * process (~10s) and instead connects in ~100ms.
+   */
+  private def tryDirectSbtConnection(
+      projectDirectory: AbsolutePath
+  ): Option[SocketConnection] = {
+    try {
+      // Read .bsp/sbt.json to get the portfile path from the data field
+      val bspConfigPath = projectDirectory.resolve(".bsp").resolve("sbt.json")
+      if (!Files.exists(bspConfigPath.toNIO)) return None
+
+      val configText = FileIO.slurp(bspConfigPath, charset)
+      val configJson = ujson.read(configText)
+      val portfilePath = Try(
+        configJson("data")("sbtPortfile").str
+      ).toOption.getOrElse(return None)
+
+      // Resolve portfile relative to the project directory
+      val portfile = new File(projectDirectory.toNIO.toFile, portfilePath)
+      if (!portfile.exists()) return None
+
+      // Parse the portfile to get socket URI and token file
+      val portfileJson = ujson.read(
+        new String(Files.readAllBytes(portfile.toPath), StandardCharsets.UTF_8)
+      )
+      val serverUri = new URI(portfileJson("uri").str)
+      val token = portfileJson.obj
+        .get("tokenfilePath")
+        .flatMap(_.strOpt)
+        .flatMap { tokenFilePath =>
+          Try {
+            val tokenJson = ujson.read(
+              new String(
+                Files.readAllBytes(new File(tokenFilePath).toPath),
+                StandardCharsets.UTF_8,
+              )
+            )
+            tokenJson("token").str
+          }.toOption
+        }
+
+      // Connect to the sbt server socket
+      val socket: Socket = serverUri.getScheme match {
+        case "local" =>
+          val path = serverUri.getSchemeSpecificPart
+          // Strip leading // from the path if present (URI format: local:///path)
+          val cleanPath =
+            if (path.startsWith("//")) path.substring(2) else path
+          if (Properties.isWin)
+            new Win32NamedPipeSocket(s"\\\\.\\pipe\\$cleanPath", false)
+          else
+            new UnixDomainSocket(cleanPath, false)
+        case "tcp" =>
+          new Socket(
+            InetAddress.getByName(serverUri.getHost),
+            serverUri.getPort,
+          )
+        case scheme =>
+          scribe.warn(s"Unsupported sbt server URI scheme: $scheme")
+          return None
+      }
+
+      val output = new ClosableOutputStream(
+        socket.getOutputStream,
+        "sbt direct socket output",
+      )
+      val input = new QuietInputStream(
+        socket.getInputStream,
+        "sbt direct socket input",
+      )
+
+      // The finished promise is completed via JSONRPC error handling when the
+      // socket disconnects; the launcher's listener thread detects the broken
+      // connection and triggers reconnection through the register() error path.
+      val finished = Promise[Unit]()
+
+      Some(
+        SocketConnection(
+          "sbt",
+          output,
+          input,
+          List(Cancelable(() => socket.close())),
+          finished,
+          optToken = token,
+        )
+      )
+    } catch {
+      case NonFatal(e) =>
+        scribe.warn(s"Failed to connect directly to sbt server: $e")
+        None
+    }
   }
 
   /**
