@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Metals launcher with per-project version support.
+# Reads .metals-version from the project root (detected via git).
+# Falls back to a default version if no file is found.
+
+default_version="1.6.6-SNAPSHOT"
+
+root=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+if [ -f "$root/.metals-version" ]; then
+  version=$(tr -d '[:space:]' < "$root/.metals-version")
+else
+  version="$default_version"
+fi
+
+exec cs launch -r ivy2local "org.scalameta:metals_2.13:$version" -- "$@"
