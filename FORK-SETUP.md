@@ -1,22 +1,24 @@
 # Fork Setup Guide
 
-This fork adds direct socket BSP connections to a shared sbt server, eliminating the 10-second JVM spawn and compile state conflicts between Metals and terminal sbt.
+## The problem
 
-## What this fork changes
+sbt enforces one server per project, but every tool that needs BSP (Metals, IntelliJ, sbtn) tries to talk to that server in its own way. The result: sbtn hangs waiting for a lock, IntelliJ fails to BSP import, Metals times out connecting, IDE compiles and terminal compiles stomp on each other's incremental compilation state. General fuckery.
 
-### sbt fork ([BrianHotopp/sbt](https://github.com/BrianHotopp/sbt/tree/feat/bsp-shared-server))
+## The fix
 
-- `build/exit` disconnects the BSP client channel instead of killing the server
-- `.bsp/sbt.json` prefers `sbtn` native binary as the BSP bridge
-- `.bsp/sbt.json` advertises the server's portfile path for direct socket connections
-- BSP `build/initialize` supports token authentication for direct socket clients
+Make all tools share one sbt server properly. Two coordinated changes across sbt and Metals:
 
-### Metals fork ([BrianHotopp/metals](https://github.com/BrianHotopp/metals/tree/feat/bsp-shared-server))
+- **sbt**: Don't kill the server when a BSP client disconnects (`build/exit` disconnects only that client's channel). Advertise the server's socket in `.bsp/sbt.json` so clients can connect directly instead of spawning a JVM.
+- **Metals**: Connect to the running sbt server's Unix domain socket (~200ms) instead of spawning `sbt -bsp` (~10s). Fall back to `sbtn -bsp` if no server is running. Auto-reconnect when the server dies.
 
-- Connects directly to a running sbt server's Unix domain socket (~200ms vs ~10s)
-- Falls back to `sbtn -bsp` process spawn if no server is running
-- Auto-reconnects when the sbt server dies (via JSONRPC listener monitoring)
-- Includes `bin/metals-launcher` for per-project Metals version pinning
+Now sbtn in the terminal, Metals in Emacs, and any other BSP client all talk to the same sbt server. One Zinc state, one compilation pipeline, no conflicts.
+
+## Repos
+
+| Repo | Branch |
+|------|--------|
+| [BrianHotopp/sbt](https://github.com/BrianHotopp/sbt/tree/feat/bsp-shared-server) | `feat/bsp-shared-server` |
+| [BrianHotopp/metals](https://github.com/BrianHotopp/metals/tree/feat/bsp-shared-server) | `feat/bsp-shared-server` |
 
 ## Setup on a new machine
 
@@ -52,9 +54,7 @@ chmod +x ~/.local/bin/metals-launcher
 
 Ensure `~/.local/bin` is on your PATH.
 
-### 5. Configure your editor
-
-#### Emacs (Eglot)
+### 5. Configure Emacs
 
 Add to `~/.emacs.d/init.el`:
 
@@ -62,16 +62,6 @@ Add to `~/.emacs.d/init.el`:
 (with-eval-after-load 'eglot
   (add-to-list 'eglot-server-programs
                '(scala-mode . ("metals-launcher"))))
-```
-
-#### VS Code
-
-In `.vscode/settings.json` per workspace:
-
-```json
-{
-  "metals.serverVersion": "1.6.6-SNAPSHOT"
-}
 ```
 
 ### 6. Configure each project
@@ -112,4 +102,4 @@ cd ~/src/metals-fork && git pull && sbt "metals/publishLocal; mtags/publishLocal
 
 ## Full technical writeup
 
-See `bsp-shared-server-writeup.md` in the repo root (if present) or the detailed commit messages in this branch's git log.
+See `bsp-shared-server-writeup.md` for the complete implementation details, design decisions, state transition analysis, and BSP spec compliance notes.
